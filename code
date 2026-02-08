@@ -1,0 +1,287 @@
+#include <iostream>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <vector>
+#include <chrono>
+#include <cstdlib>
+
+using namespace std;
+
+/* =========================
+CONFIGURATION
+========================= */
+const int BUFFER_SIZE = 5;
+const int MAX_RESOURCES = 3;
+
+/* =========================
+PROCESS STATE
+========================= */
+enum ProcessState {
+NEW,
+READY,
+RUNNING,
+BLOCKED,
+TERMINATED
+};
+
+/* =========================
+PCB (Process Control Block)
+========================= */
+struct PCB {
+int pid;
+int arrivalTime;
+int burstTime;
+int priority;
+vector<int> maxNeed;
+vector<int> allocation;
+ProcessState state;
+};
+
+/* =========================
+GLOBAL SHARED DATA
+========================= */
+queue<PCB> readyQueue;
+queue<PCB> blockedQueue;
+
+mutex mtx;
+condition_variable cv_empty, cv_full;
+
+bool simulationRunning = false;
+int pidCounter = 1;
+
+/* =========================
+BANKER DATA
+========================= */
+vector<int> available = {3, 3, 2};
+
+/* =========================
+UTILITY
+========================= */
+string stateToStr(ProcessState s) {
+if (s == NEW) return "NEW";
+if (s == READY) return "READY";
+if (s == RUNNING) return "RUNNING";
+if (s == BLOCKED) return "BLOCKED";
+return "TERMINATED";
+}
+
+/* =========================
+BANKER'S SAFETY CHECK
+========================= */
+bool isSafe(PCB &p) {
+for (int i = 0; i < MAX_RESOURCES; i++) {
+int need = p.maxNeed[i] - p.allocation[i];
+if (need > available[i])
+return false;
+}
+return true;
+}
+
+/* =========================
+PRODUCER (Process Generator)
+========================= */
+void producer(int id) {
+while (simulationRunning) {
+this_thread::sleep_for(chrono::seconds(2));
+
+unique_lock<mutex> lock(mtx);
+cv_full.wait(lock, [] {
+return readyQueue.size() < BUFFER_SIZE || !simulationRunning;
+});
+
+if (!simulationRunning) return;
+
+PCB p;
+p.pid = pidCounter++;
+p.arrivalTime = time(nullptr);
+p.burstTime = rand() % 5 + 1;
+p.priority = rand() % 5 + 1;
+p.state = READY;
+
+for (int i = 0; i < MAX_RESOURCES; i++) {
+int m = rand() % 3 + 1;
+p.maxNeed.push_back(m);
+p.allocation.push_back(0);
+}
+
+readyQueue.push(p);
+cout << "[Producer " << id << "] Created P"
+<< p.pid << " (BT=" << p.burstTime
+<< ", Priority=" << p.priority << ")\n";
+
+cv_empty.notify_one();
+}
+}
+
+/* =========================
+SCHEDULER + CONSUMER (CPU)
+========================= */
+void consumer() {
+while (simulationRunning) {
+unique_lock<mutex> lock(mtx);
+cv_empty.wait(lock, [] {
+return !readyQueue.empty() || !simulationRunning;
+});
+
+if (!simulationRunning) return;
+
+PCB p = readyQueue.front();
+readyQueue.pop();
+cv_full.notify_one();
+
+cout << "\n[CPU] Picked P" << p.pid << endl;
+
+if (!isSafe(p)) {
+p.state = BLOCKED;
+blockedQueue.push(p);
+cout << "[Banker] P" << p.pid << " BLOCKED (unsafe)\n";
+continue;
+}
+
+// Allocate resources
+for (int i = 0; i < MAX_RESOURCES; i++) {
+int need = p.maxNeed[i] - p.allocation[i];
+available[i] -= need;
+p.allocation[i] += need;
+}
+
+p.state = RUNNING;
+cout << "[CPU] Running P" << p.pid << "...\n";
+lock.unlock();
+
+this_thread::sleep_for(chrono::seconds(p.burstTime));
+
+lock.lock();
+p.state = TERMINATED;
+
+// Release resources
+for (int i = 0; i < MAX_RESOURCES; i++) {
+available[i] += p.allocation[i];
+p.allocation[i] = 0;
+}
+
+cout << "[CPU] P" << p.pid << " TERMINATED\n";
+
+// Recheck blocked processes
+int n = blockedQueue.size();
+while (n--) {
+PCB bp = blockedQueue.front();
+blockedQueue.pop();
+
+if (isSafe(bp)) {
+bp.state = READY;
+readyQueue.push(bp);
+cout << "[Banker] Unblocked P" << bp.pid << endl;
+cv_empty.notify_one();
+} else {
+blockedQueue.push(bp);
+}
+}
+}
+}
+
+/* =========================
+MANUAL PROCESS ADD
+========================= */
+void addProcessManually() {
+PCB p;
+p.pid = pidCounter++;
+cout << "Burst Time: ";
+cin >> p.burstTime;
+cout << "Priority: ";
+cin >> p.priority;
+
+for (int i = 0; i < MAX_RESOURCES; i++) {
+int m;
+cout << "Max need R" << i << ": ";
+cin >> m;
+p.maxNeed.push_back(m);
+p.allocation.push_back(0);
+}
+
+p.state = READY;
+
+unique_lock<mutex> lock(mtx);
+if (readyQueue.size() < BUFFER_SIZE) {
+readyQueue.push(p);
+cout << "Process P" << p.pid << " added\n";
+cv_empty.notify_one();
+} else {
+cout << "Ready Queue FULL\n";
+}
+}
+
+/* =========================
+DISPLAY SYSTEM STATE
+========================= */
+void displayState() {
+unique_lock<mutex> lock(mtx);
+
+cout << "\n--- READY QUEUE ---\n";
+queue<PCB> temp = readyQueue;
+while (!temp.empty()) {
+PCB p = temp.front(); temp.pop();
+cout << "P" << p.pid << " (" << stateToStr(p.state) << ")\n";
+}
+
+cout << "--- BLOCKED QUEUE ---\n";
+temp = blockedQueue;
+while (!temp.empty()) {
+PCB p = temp.front(); temp.pop();
+cout << "P" << p.pid << "\n";
+}
+
+cout << "--- AVAILABLE RESOURCES ---\n";
+for (int i = 0; i < MAX_RESOURCES; i++)
+cout << "R" << i << ": " << available[i] << " ";
+cout << "\n\n";
+}
+
+/* =========================
+MAIN
+========================= */
+int main() {
+srand(time(nullptr));
+int choice;
+
+thread p1, p2, cpu;
+
+while (true) {
+cout << "\n===== MINI OS SIMULATOR =====\n";
+cout << "1. Start Simulation\n";
+cout << "2. Add Process Manually\n";
+cout << "3. Display System State\n";
+cout << "4. Exit\n";
+cout << "Choice: ";
+cin >> choice;
+
+if (choice == 1 && !simulationRunning) {
+simulationRunning = true;
+p1 = thread(producer, 1);
+p2 = thread(producer, 2);
+cpu = thread(consumer);
+cout << "Simulation Started\n";
+}
+else if (choice == 2) {
+addProcessManually();
+}
+else if (choice == 3) {
+displayState();
+}
+else if (choice == 4) {
+simulationRunning = false;
+cv_empty.notify_all();
+cv_full.notify_all();
+break;
+}
+}
+
+if (p1.joinable()) p1.join();
+if (p2.joinable()) p2.join();
+if (cpu.joinable()) cpu.join();
+
+cout << "Simulator Exited Cleanly\n";
+return 0;
+}
